@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -105,6 +106,7 @@ class AgentRunner:
         runner_repo: str,
         bot_username: str,
         webhook_secret: Optional[str] = None,
+        allow_insecure_webhooks: bool = False,
         fork_timeout: int = 120,
         fork_poll_interval: int = 5,
     ):
@@ -116,6 +118,7 @@ class AgentRunner:
             runner_repo: Repository containing the workflow (e.g., "your-org/Agent-Runner")
             bot_username: GitHub username of the bot account
             webhook_secret: Secret for signing webhook payloads (optional but recommended)
+            allow_insecure_webhooks: If True, accept unsigned webhook callbacks when webhook_secret is not configured
             fork_timeout: Maximum seconds to wait for fork to be ready
             fork_poll_interval: Seconds between fork status checks
         """
@@ -123,6 +126,7 @@ class AgentRunner:
         self.runner_repo = runner_repo
         self.bot_username = bot_username
         self.webhook_secret = webhook_secret
+        self.allow_insecure_webhooks = allow_insecure_webhooks
         self.fork_timeout = fork_timeout
         self.fork_poll_interval = fork_poll_interval
         
@@ -155,6 +159,17 @@ class AgentRunner:
         """Validate repository path format (owner/repo)."""
         pattern = r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$'
         return bool(re.match(pattern, repo))
+
+    @staticmethod
+    def _validate_callback_url(callback_url: str) -> bool:
+        """Validate callback URL format (http/https)."""
+        if not callback_url or any(ch.isspace() for ch in callback_url):
+            return False
+        try:
+            parsed = urlsplit(callback_url)
+        except Exception:
+            return False
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
     
     async def submit_job(
         self,
@@ -184,6 +199,14 @@ class AgentRunner:
         
         if not prompt or not prompt.strip():
             raise ValueError("Prompt cannot be empty")
+
+        callback_url = callback_url.strip() if callback_url is not None else None
+        if callback_url == "":
+            callback_url = None
+        if callback_url and not self._validate_callback_url(callback_url):
+            raise ValueError(
+                "Invalid callback_url. Expected an http(s) URL, e.g. https://your-app.com/webhook/agent-runner"
+            )
         
         job_id = f"job-{uuid.uuid4().hex[:12]}"
         job = Job(
@@ -389,14 +412,17 @@ class AgentRunner:
         
         Args:
             payload: Raw request body
-            signature: X-Hub-Signature-256 header value
+            signature: X-Signature-256 header value
             
         Returns:
             True if signature is valid
         """
         if not self.webhook_secret:
-            logger.warning("No webhook_secret configured - signature verification skipped")
-            return True  # No secret configured, skip verification
+            if self.allow_insecure_webhooks:
+                logger.warning("No webhook_secret configured - signature verification skipped")
+                return True
+            logger.error("No webhook_secret configured - rejecting webhook because signature cannot be verified")
+            return False
         
         expected = "sha256=" + hmac.new(
             self.webhook_secret.encode(),
@@ -411,7 +437,7 @@ class AgentRunner:
 def create_fastapi_app():
     """Create a FastAPI application with Agent Runner endpoints."""
     try:
-        from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+        from fastapi import FastAPI, HTTPException, Request
         from pydantic import BaseModel
     except ImportError:
         print("FastAPI not installed. Run: pip install fastapi uvicorn")
@@ -421,12 +447,18 @@ def create_fastapi_app():
     
     app = FastAPI(title="Agent Runner API")
     
+    allow_insecure_webhooks = os.environ.get("ALLOW_INSECURE_WEBHOOKS", "").lower() in ("1", "true", "yes")
     runner = AgentRunner(
         bot_token=os.environ["BOT_TOKEN"],
         runner_repo=os.environ["RUNNER_REPO"],
         bot_username=os.environ["BOT_USERNAME"],
         webhook_secret=os.environ.get("WEBHOOK_SECRET"),
+        allow_insecure_webhooks=allow_insecure_webhooks,
     )
+
+    @app.on_event("shutdown")
+    async def shutdown() -> None:
+        await runner.close()
     
     class SubmitJobRequest(BaseModel):
         upstream_repo: str
@@ -449,8 +481,13 @@ def create_fastapi_app():
                 callback_url=request.callback_url,
             )
             return job.to_dict()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception:
+            logger.exception("Unexpected error while submitting job")
+            raise HTTPException(status_code=500, detail="Internal server error")
     
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str):

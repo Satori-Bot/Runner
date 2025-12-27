@@ -46,7 +46,7 @@ Add these secrets to your Agent-Runner repository:
 | `BOT_TOKEN` | GitHub PAT with `repo` scope |
 | `LLM_API_KEY` | API key for your LLM provider |
 | `LLM_MODEL` | (Optional) Model name, defaults to `anthropic/claude-sonnet-4-5-20250929` |
-| `WEBHOOK_SECRET` | (Optional) Secret for signing webhook callbacks |
+| `WEBHOOK_SECRET` | Secret for signing/validating webhook callbacks (recommended; required unless `ALLOW_INSECURE_WEBHOOKS=1`) |
 
 ### 2. Deploy Backend Service
 
@@ -58,7 +58,8 @@ pip install -r requirements.txt
 export BOT_TOKEN="ghp_xxx"
 export RUNNER_REPO="your-org/Agent-Runner"
 export BOT_USERNAME="your-bot-username"
-export WEBHOOK_SECRET="your-secret-key"  # Optional
+export WEBHOOK_SECRET="your-secret-key"  # Recommended (required to verify callback signatures)
+# Local dev only (not recommended): export ALLOW_INSECURE_WEBHOOKS=1
 
 # Run with uvicorn
 uvicorn agent_runner:create_fastapi_app --factory --host 0.0.0.0 --port 8000
@@ -112,6 +113,7 @@ When the workflow completes, it sends a POST request to your `callback_url`:
   "branch": "bot/job-abc123def456"
 }
 ```
+`pr_url` may be `null` if no PR was created (e.g., no changes).
 
 ### Failure Payload
 ```json
@@ -126,7 +128,7 @@ When the workflow completes, it sends a POST request to your `callback_url`:
 
 ### Signature Verification
 
-If `WEBHOOK_SECRET` is configured, the callback includes an `X-Signature-256` header:
+If `WEBHOOK_SECRET` is configured, the callback includes an `X-Signature-256` header (custom header used by Agent-Runner callbacks):
 
 ```
 X-Signature-256: sha256=<HMAC-SHA256 of payload>
@@ -160,7 +162,7 @@ async def main():
         bot_token="ghp_xxxxxxxxxxxx",           # GitHub PAT with repo scope
         runner_repo="your-org/Agent-Runner",    # This repository
         bot_username="your-bot-username",       # GitHub bot account username
-        webhook_secret="your-secret-key",       # Optional: for webhook signature
+        webhook_secret="your-secret-key",       # Required to verify callback signatures (recommended)
     )
 
     # Submit a job
@@ -194,7 +196,12 @@ runner = AgentRunner(
     runner_repo=os.environ["RUNNER_REPO"],
     bot_username=os.environ["BOT_USERNAME"],
     webhook_secret=os.environ.get("WEBHOOK_SECRET"),
+    allow_insecure_webhooks=os.environ.get("ALLOW_INSECURE_WEBHOOKS") == "1",
 )
+
+@app.on_event("shutdown")
+async def shutdown():
+    await runner.close()
 
 class SubmitRequest(BaseModel):
     upstream_repo: str
@@ -211,8 +218,10 @@ async def submit_job(request: SubmitRequest):
             callback_url=request.callback_url,
         )
         return job.to_dict()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
@@ -261,6 +270,8 @@ runner = AgentRunner(
     bot_token=os.environ["BOT_TOKEN"],
     runner_repo=os.environ["RUNNER_REPO"],
     bot_username=os.environ["BOT_USERNAME"],
+    webhook_secret=os.environ.get("WEBHOOK_SECRET"),
+    allow_insecure_webhooks=os.environ.get("ALLOW_INSECURE_WEBHOOKS") == "1",
 )
 
 @app.route("/api/jobs", methods=["POST"])
@@ -269,6 +280,7 @@ def submit_job():
     
     # Run async code in sync context
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         job = loop.run_until_complete(
             runner.submit_job(
@@ -285,7 +297,12 @@ def submit_job():
 
 @app.route("/webhook/agent-runner", methods=["POST"])
 def handle_callback():
-    data = request.json
+    signature = request.headers.get("X-Signature-256", "")
+    body = request.get_data()
+    if not runner.verify_webhook_signature(body, signature):
+        return jsonify({"error": "Invalid signature"}), 401
+
+    data = request.get_json() or {}
     job = runner.update_job_from_callback(
         job_id=data["job_id"],
         status=data["status"],
@@ -305,6 +322,7 @@ runner = AgentRunner(
     
     # Advanced options
     webhook_secret="your-hmac-secret",     # For callback signature verification
+    allow_insecure_webhooks=False,         # Set True only for local dev without webhook signatures
     fork_timeout=180,                       # Max seconds to wait for fork (default: 120)
     fork_poll_interval=3,                   # Seconds between fork status checks (default: 5)
 )

@@ -38,18 +38,22 @@ jobs:
       - name: Clone fork
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
         run: |
           set -euo pipefail
-          git clone "https://x-access-token:${BOT_TOKEN}@github.com/${{ inputs.fork_repo }}.git" repo
+          git clone "https://x-access-token:${BOT_TOKEN}@github.com/${FORK_REPO}.git" repo
           cd repo
-          git remote add upstream "https://github.com/${{ inputs.upstream_repo }}.git" || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
           git fetch upstream --prune
 
       - name: Create branch
+        env:
+          JOB_ID: ${{ inputs.job_id }}
         run: |
           set -euo pipefail
           cd repo
-          BR="bot/${{ inputs.job_id }}"
+          BR="bot/${JOB_ID}"
           echo "BRANCH=$BR" >> "$GITHUB_ENV"
           git checkout -b "$BR"
 
@@ -114,12 +118,13 @@ jobs:
           print("Agent completed successfully!")
           AGENT_SCRIPT
           
-          # Run the agent with the prompt (use heredoc to avoid shell injection)
+          # Run the agent; prompt is passed via AGENT_PROMPT environment variable
           python run_agent.py
 
       - name: Commit & push
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PROMPT: ${{ inputs.prompt }}
         run: |
           set -euo pipefail
           cd repo
@@ -130,12 +135,13 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
             echo "HAS_CHANGES=false" >> "$GITHUB_ENV"
+            echo "PR_URL=" >> "$GITHUB_ENV"
             exit 0
           fi
 
           echo "HAS_CHANGES=true" >> "$GITHUB_ENV"
           # Truncate prompt for commit message (max 72 chars)
-          COMMIT_MSG="bot: $(echo '${{ inputs.prompt }}' | head -c 60)"
+          COMMIT_MSG="bot: $(printf '%s' "$PROMPT" | head -c 60)"
           git commit -m "$COMMIT_MSG"
           git push -u origin "$BRANCH"
 
@@ -144,6 +150,10 @@ jobs:
         if: env.HAS_CHANGES == 'true'
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          PROMPT: ${{ inputs.prompt }}
+          JOB_ID: ${{ inputs.job_id }}
         run: |
           set -euo pipefail
 
@@ -151,14 +161,18 @@ jobs:
           base=$(curl -s \
             -H "Authorization: Bearer ${BOT_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ inputs.upstream_repo }}" | jq -r .default_branch)
+            "https://api.github.com/repos/${UPSTREAM_REPO}" | jq -r .default_branch)
+          if [ -z "$base" ] || [ "$base" = "null" ]; then
+            echo "::error::Failed to resolve upstream default branch."
+            exit 1
+          fi
 
           # 2) head must be "<fork_owner>:<branch>"
-          fork_owner=$(echo "${{ inputs.fork_repo }}" | cut -d/ -f1)
+          fork_owner=$(echo "${FORK_REPO}" | cut -d/ -f1)
           head="${fork_owner}:${BRANCH}"
 
-          title="Bot: ${{ inputs.prompt }}"
-          body="Automated changes via Agent Runner.\n\nJob: ${{ inputs.job_id }}"
+          title="Bot: ${PROMPT}"
+          body=$(printf "Automated changes via Agent Runner.\n\nJob: %s" "$JOB_ID")
 
           payload=$(jq -n \
             --arg title "$title" \
@@ -167,24 +181,51 @@ jobs:
             --arg body "$body" \
             '{title:$title, head:$head, base:$base, body:$body}')
 
-          pr=$(curl -s -X POST \
+          pr_response=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Authorization: Bearer ${BOT_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ inputs.upstream_repo }}/pulls" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/pulls" \
             -d "$payload")
 
-          # Check for errors in PR creation
-          pr_error=$(echo "$pr" | jq -r '.message // empty')
-          if [ -n "$pr_error" ]; then
-            echo "::error::Failed to create PR: $pr_error"
-            # Still try to get URL in case it's a "already exists" error
+          pr_body=$(echo "$pr_response" | sed '$d')
+          pr_status=$(echo "$pr_response" | tail -n1)
+
+          pr_url=""
+
+          if [ "$pr_status" = "201" ]; then
+            pr_url=$(echo "$pr_body" | jq -r '.html_url // empty')
+          else
+            pr_message=$(echo "$pr_body" | jq -r '.message // empty' 2>/dev/null || true)
+            pr_errors=$(echo "$pr_body" | jq -r '.errors[]?.message? // empty' 2>/dev/null || true)
+
+            if echo "$pr_errors $pr_message" | grep -qi "already exists"; then
+              echo "::warning::PR already exists for head '$head'; fetching existing PR URL."
+              existing_prs=$(curl -sS \
+                -H "Authorization: Bearer ${BOT_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                --get \
+                --data-urlencode "head=${head}" \
+                --data-urlencode "state=open" \
+                --data-urlencode "per_page=1" \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/pulls")
+
+              pr_url=$(echo "$existing_prs" | jq -r '.[0].html_url // empty')
+            else
+              echo "::error::Failed to create PR (HTTP $pr_status): ${pr_message:-unknown error}"
+              echo "$pr_body" | jq -r '.' || true
+              exit 1
+            fi
           fi
-          
-          pr_url=$(echo "$pr" | jq -r '.html_url // empty')
+
+          if [ -z "$pr_url" ] || [ "$pr_url" = "null" ]; then
+            echo "::error::PR URL is empty; failing step to avoid misleading success."
+            exit 1
+          fi
+
           echo "PR URL: $pr_url"
-          
+
           # Save PR URL for callback
-          echo "PR_URL=${pr_url:-none}" >> "$GITHUB_ENV"
+          echo "PR_URL=$pr_url" >> "$GITHUB_ENV"
 
       # ========================================
       # Callback Notification (always runs)
@@ -193,22 +234,26 @@ jobs:
         if: (success() || env.HAS_CHANGES == 'false') && inputs.callback_url != ''
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          JOB_ID: ${{ inputs.job_id }}
         run: |
           set -euo pipefail
           
-          callback_url="${{ inputs.callback_url }}"
+          callback_url="$CALLBACK_URL"
           
           payload=$(jq -n \
-            --arg job_id "${{ inputs.job_id }}" \
+            --arg job_id "$JOB_ID" \
             --arg status "completed" \
-            --arg pr_url "$PR_URL" \
-            --arg upstream_repo "${{ inputs.upstream_repo }}" \
-            --arg fork_repo "${{ inputs.fork_repo }}" \
-            --arg branch "$BRANCH" \
+            --arg pr_url "${PR_URL:-}" \
+            --arg upstream_repo "$UPSTREAM_REPO" \
+            --arg fork_repo "$FORK_REPO" \
+            --arg branch "${BRANCH:-}" \
             '{
               job_id: $job_id,
               status: $status,
-              pr_url: $pr_url,
+              pr_url: (if $pr_url == "" then null else $pr_url end),
               upstream_repo: $upstream_repo,
               fork_repo: $fork_repo,
               branch: $branch
@@ -235,17 +280,21 @@ jobs:
         if: failure() && inputs.callback_url != ''
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          JOB_ID: ${{ inputs.job_id }}
         run: |
           set -euo pipefail
           
-          callback_url="${{ inputs.callback_url }}"
+          callback_url="$CALLBACK_URL"
           
           payload=$(jq -n \
-            --arg job_id "${{ inputs.job_id }}" \
+            --arg job_id "$JOB_ID" \
             --arg status "failed" \
             --arg error "Workflow failed. Check GitHub Actions logs for details." \
-            --arg upstream_repo "${{ inputs.upstream_repo }}" \
-            --arg fork_repo "${{ inputs.fork_repo }}" \
+            --arg upstream_repo "$UPSTREAM_REPO" \
+            --arg fork_repo "$FORK_REPO" \
             '{
               job_id: $job_id,
               status: $status,
